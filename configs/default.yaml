@@ -1,0 +1,54 @@
+# Default Configuration for Vision Mamba Training
+# ================================================
+
+# Dataset Configuration
+dataset:
+  name: "bloodmnist"          # Options: dermamnist, bloodmnist, octmnist, pneumoniamnist, etc.
+  data_root: "./data"
+  image_size: 224
+  num_workers: 8
+
+# Model Configuration
+model:
+  patch_size: 4               # 4 for medical (fine detail), 16 for natural images
+  dims: [32, 64, 128, 256]    # Channel dimensions per stage
+  depths: [2, 2, 4, 2]        # Number of blocks per stage
+  d_state: 16                 # SSM state dimension
+  d_conv: 4                   # Local convolution width
+  expand: 2                   # Expansion factor for inner dimension
+  drop_rate: 0.0
+  drop_path_rate: 0.1
+
+# Training Configuration
+training:
+  epochs: 50
+  batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  warmup_epochs: 5
+  min_lr: 1.0e-6
+  grad_clip: 1.0
+
+# Controllability Analysis
+controllability:
+  method: "jacobian"          # Options: jacobian, gramian
+  layer_weighting: "exponential"  # Options: exponential, linear, uniform
+  normalize: true
+
+# Evaluation
+evaluation:
+  num_samples: 50
+  perturbation_percent: 0.1
+  num_test_classes: 5
+
+# Output
+output:
+  checkpoint_dir: "./checkpoints"
+  save_freq: 10               # Save checkpoint every N epochs
+  eval_freq: 1                # Evaluate every N epochs
+  log_freq: 50                # Log every N batches
+
+# System
+system:
+  device: "cuda"
+  seed: 42
