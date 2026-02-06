@@ -268,9 +268,6 @@ If you find this work useful, please cite:
 ```bibtex
 @article{author2024controllability,
   title={Controllability Analysis for Vision State Space Models: A Structural Interpretability Framework},
-  author={Author Names},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2024}
 }
 ```
 
