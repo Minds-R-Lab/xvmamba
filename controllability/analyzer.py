@@ -16,7 +16,7 @@ in the X-VMamba paper:
 Both methods produce influence scores that quantify how much each input
 patch controls the model's internal state dynamics.
 
-Reference: Mabrok & Zafari, "X-VMamba: Explainable Vision Mamba"
+Reference: companion paper (under double-anonymous review)
 """
 
 import torch
@@ -157,20 +157,28 @@ class JacobianControllability:
             # ---- Step 1: Score position k BEFORE updating Q ----
             # This ensures Q holds only the influence from positions k+1..L,
             # preventing double-counting of the direct term.
-            
-            # Direct influence: ||C_k ⊙ B_k||
-            #   CB[b, i] = sum_n |c_{k,n}| * |b_{k,i,n}|
-            #   direct = ||CB||_2 over inner dimension
+            #
+            # Channel aggregation: arithmetic mean over the inner channel
+            # dimension D, matching Eq. (36) of the manuscript:
+            #     S_k^{(dir)} = (1/D) sum_d J_k^{(d)}.
+            # (Earlier revisions used torch.norm here, an L2 aggregation;
+            # this was changed to .mean() on 2026-05-14 to match the paper
+            # and resolve a code-vs-paper consistency issue. See
+            # LOGS/01_math.md and LOGS/02_experiments.md for the diagnosis
+            # and the before/after numbers.)
+
+            # Direct influence: per-channel CB[b, i] = sum_n |c_{k,n}| * |b_{k,i,n}|.
+            # CB[b, i] equals the direct-term J_k^{(d=i),direct} of the manuscript;
+            # we mean across channels to obtain a single per-position scalar.
             CB = torch.einsum('bn,bin->bi', C_k_abs, B_k.abs())  # [batch, d_inner]
-            direct_inf = torch.norm(CB, dim=-1)  # [batch]
-            
-            # Propagated influence: ||Q ⊙ B_k||
-            #   QB[b, i] = sum_n Q[b, n, i] * |b_{k,i,n}|
-            #   propagated = ||QB||_2 over inner dimension
+            direct_inf = CB.mean(dim=-1)  # [batch]
+
+            # Propagated influence: per-channel QB[b, i] = sum_n Q[b, n, i] * |b_{k,i,n}|.
             # Q is non-negative by construction (accumulates |C| * positive A),
-            # so taking abs of B prevents sign cancellation.
+            # so taking abs of B prevents sign cancellation; we then mean
+            # across channels to match the paper's aggregation.
             QB = torch.einsum('bni,bin->bi', Q, B_k.abs())  # [batch, d_inner]
-            prop_inf = torch.norm(QB, dim=-1)  # [batch]
+            prop_inf = QB.mean(dim=-1)  # [batch]
             
             # Store results
             direct_influence[:, k] = direct_inf

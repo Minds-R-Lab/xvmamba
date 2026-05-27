@@ -55,6 +55,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models import VMambaClassifier, VMambaConfig
+from models.vim_classifier import VimClassifier, VimConfig
 from controllability import ControllabilityAnalyzer
 from data import DatasetType, get_dataloader, get_dataset_info
 
@@ -102,26 +103,87 @@ def apply_pub_style():
     })
 
 
+
+def _to_picklable(obj):
+    """Recursively convert defaultdict (with lambda default_factory) and
+    any nested defaultdicts into plain dicts so that torch.save / pickle
+    can serialise them. Leaves other types untouched."""
+    from collections import defaultdict as _dd
+    if isinstance(obj, _dd):
+        obj = dict(obj)
+    if isinstance(obj, dict):
+        return {k: _to_picklable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_picklable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_to_picklable(v) for v in obj)
+    return obj
+
+
 # ============================================================================
 # Model Loading
 # ============================================================================
 
 def load_model(checkpoint_path, device):
+    """Load a checkpoint, dispatching on the saved `model_arch` flag.
+
+    Backwards compatible: checkpoints saved before the Vim wiring don't
+    have `model_arch` in their args dict; we default to "vmamba".
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = checkpoint.get('args', {})
+    arch = str(args.get('model_arch', 'vmamba')).lower()
 
-    config = VMambaConfig(
-        image_size=args.get('image_size', 224),
-        patch_size=args.get('patch_size', 4),
-        in_channels=args.get('in_channels', 3),
-        dims=args.get('dims', [32, 64, 128, 256]),
-        depths=args.get('depths', [2, 2, 4, 2]),
-        d_state=args.get('d_state', 16),
-        num_classes=args.get('num_classes', 7),
-    )
+    if arch == 'vmamba':
+        config = VMambaConfig(
+            image_size=args.get('image_size', 224),
+            patch_size=args.get('patch_size', 4),
+            in_channels=args.get('in_channels', 3),
+            dims=args.get('dims', [32, 64, 128, 256]),
+            depths=args.get('depths', [2, 2, 4, 2]),
+            d_state=args.get('d_state', 16),
+            num_classes=args.get('num_classes', 7),
+        )
+        model = VMambaClassifier(config)
+    elif arch == 'vim':
+        config = VimConfig(
+            image_size=args.get('image_size', 224),
+            patch_size=args.get('patch_size', 16),
+            in_channels=args.get('in_channels', 3),
+            d_model=args.get('vim_d_model', 192),
+            depth=args.get('vim_depth', 12),
+            d_state=args.get('d_state', 16),
+            num_classes=args.get('num_classes', 10),
+            drop_rate=args.get('drop_rate', 0.0),
+            mlp_ratio=args.get('vim_mlp_ratio', 4.0),
+        )
+        model = VimClassifier(config)
+    else:
+        raise ValueError(f"unknown model_arch in checkpoint: {arch!r}")
 
-    model = VMambaClassifier(config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Adapter for checkpoints saved with mamba-ssm CUDA path.
+    # When the original training used FastSelectiveSSM (mamba-ssm CUDA backend),
+    # the SSM parameters were stored under a `.mamba.` prefix:
+    #     stages.X.blocks.Y.ss2d.ssm.mamba.A_log
+    # When we evaluate on CPU (no mamba-ssm), the slow Python path flattens those:
+    #     stages.X.blocks.Y.ss2d.ssm.A_log
+    # We strip the `.mamba.` segment from each key when the model expects flat keys.
+    state = checkpoint['model_state_dict']
+    model_keys = set(model.state_dict().keys())
+    if any(k.endswith('.mamba.A_log') for k in state.keys()) and \
+       not any(k.endswith('.mamba.A_log') for k in model_keys):
+        # Strip `.ssm.mamba.` (VMamba) or `.ssm_forward.mamba.` /
+        # `.ssm_backward.mamba.` (Vim) so flat state dicts load on
+        # either the CUDA or the slow-Python path.
+        new_state = {}
+        for k, v in state.items():
+            k = k.replace('.ssm.mamba.', '.ssm.')
+            k = k.replace('.ssm_forward.mamba.', '.ssm_forward.')
+            k = k.replace('.ssm_backward.mamba.', '.ssm_backward.')
+            new_state[k] = v
+        state = new_state
+    model.load_state_dict(state)
+
     model = model.to(device)
     model.eval()
     return model, config
@@ -220,8 +282,19 @@ class GradCAMSaliency:
             self.activations = output.detach()
         def bwd_hook(module, grad_input, grad_output):
             self.gradients = grad_output[0].detach()
-        
-        last_block = self.model.stages[-1].blocks[-1]
+
+        # Auto-locate the last feature-map block so the same hook works on
+        # both VMamba (hierarchical `stages[-1].blocks[-1]`) and Vim
+        # (plain `blocks[-1]`).
+        if hasattr(self.model, "stages") and len(self.model.stages) > 0:
+            last_block = self.model.stages[-1].blocks[-1]
+        elif hasattr(self.model, "blocks") and len(self.model.blocks) > 0:
+            last_block = self.model.blocks[-1]
+        else:
+            raise AttributeError(
+                "Could not locate a last feature-map block on this model "
+                "(no `stages` or `blocks` attribute)."
+            )
         last_block.register_forward_hook(fwd_hook)
         last_block.register_full_backward_hook(bwd_hook)
     
@@ -238,20 +311,45 @@ class GradCAMSaliency:
         output.backward(gradient=one_hot, retain_graph=True)
         
         if self.gradients is not None and self.activations is not None:
-            weights = self.gradients.mean(dim=(1, 2), keepdim=True)
-            cam = (weights * self.activations).sum(dim=-1)
-            cam = F.relu(cam).squeeze(0)
-            
+            # The activations and gradients shapes depend on the architecture:
+            #   VMamba (channels-last 2D): [B, H, W, C]
+            #   Vim    (flat sequence):    [B, L, C], with L = H_grid * W_grid
+            # We dispatch on rank so Grad-CAM works on both.
+            if self.activations.ndim == 4:
+                # [B, H, W, C]: average gradients over spatial dims.
+                weights = self.gradients.mean(dim=(1, 2), keepdim=True)   # [B, 1, 1, C]
+                cam = (weights * self.activations).sum(dim=-1)             # [B, H, W]
+                cam = F.relu(cam).squeeze(0)                                # [H, W]
+            elif self.activations.ndim == 3:
+                # [B, L, C]: average over token positions.
+                weights = self.gradients.mean(dim=1, keepdim=True)          # [B, 1, C]
+                cam_seq = (weights * self.activations).sum(dim=-1)          # [B, L]
+                cam_seq = F.relu(cam_seq).squeeze(0)                        # [L]
+                # Reshape sequence back to a (h_grid, w_grid) map.
+                L = cam_seq.shape[0]
+                side = int(round(L ** 0.5))
+                if side * side != L:
+                    raise ValueError(
+                        f"Grad-CAM: cannot reshape sequence length {L} to a "
+                        f"square grid; got side={side}."
+                    )
+                cam = cam_seq.view(side, side)
+            else:
+                raise ValueError(
+                    f"Unexpected activations rank for Grad-CAM: "
+                    f"{tuple(self.activations.shape)}"
+                )
+
             if cam.max() > 0:
                 cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
-            
+
             h, w = image.shape[2], image.shape[3]
             if cam.shape[0] != h or cam.shape[1] != w:
                 cam = F.interpolate(
                     cam.unsqueeze(0).unsqueeze(0),
                     size=(h, w), mode='bilinear', align_corners=False
                 ).squeeze()
-            
+
             return cam.cpu()
         
         return torch.rand(image.shape[2], image.shape[3])
@@ -268,7 +366,8 @@ class RandomSaliency:
 # ============================================================================
 
 def perturbation_invariance_test(model, dataloader, device, num_samples=50,
-                                  perturb_percent=0.1, perturbation_strength=0.5):
+                                  perturb_percent=0.1, perturbation_strength=0.5,
+                                  min_orig_conf=0.0):
     """
     Test whether controllability correctly identifies influential regions.
     
@@ -298,7 +397,7 @@ def perturbation_invariance_test(model, dataloader, device, num_samples=50,
         'Random': random_sal,
     }
     
-    results = {name: {'high_drop': [], 'low_drop': [], 'ratio': []} 
+    results = {name: {'high_drop': [], 'low_drop': [], 'ratio': [], 'drop_diff': []} 
                for name in methods}
     
     sample_count = 0
@@ -316,7 +415,8 @@ def perturbation_invariance_test(model, dataloader, device, num_samples=50,
             orig_conf = F.softmax(output, dim=1)[0, pred_class].item()
         
         # Skip if model is very uncertain
-        if orig_conf < 0.3:
+        # G3: confidence filter (default 0.0 = no filter); documented in caption.
+        if orig_conf < min_orig_conf:
             continue
         
         h, w = image.shape[2], image.shape[3]
@@ -365,8 +465,10 @@ def perturbation_invariance_test(model, dataloader, device, num_samples=50,
                 
                 results[name]['high_drop'].append(high_drop)
                 results[name]['low_drop'].append(low_drop)
-                
-                # Ratio (with epsilon to avoid division by zero)
+                # B1: drop_diff is bounded and interpretable; ratio retained
+                # for backwards compatibility but is unstable near low_drop=0.
+                results[name]['drop_diff'].append(high_drop - low_drop)
+
                 ratio = high_drop / (low_drop + 1e-6) if low_drop > 0 else high_drop / 1e-6
                 results[name]['ratio'].append(ratio)
                 
@@ -390,12 +492,16 @@ def perturbation_invariance_test(model, dataloader, device, num_samples=50,
             low_std = np.std(results[name]['low_drop'])
             ratio_mean = np.mean(results[name]['ratio'])
             
+            diff_mean = float(np.mean(results[name]['drop_diff']))
+            diff_std  = float(np.std(results[name]['drop_diff']))
             summary[name] = {
                 'high_drop_mean': high_mean,
                 'high_drop_std': high_std,
                 'low_drop_mean': low_mean,
                 'low_drop_std': low_std,
-                'ratio_mean': ratio_mean,
+                'drop_diff_mean': diff_mean,
+                'drop_diff_std':  diff_std,
+                'ratio_mean': ratio_mean,  # deprecated -- unstable near low_drop=0
             }
             
             # Interpretation
@@ -446,7 +552,8 @@ def cross_class_consistency_test(model, dataloader, device, num_classes,
     ctrl_g = StructuralControllability(model, device, 'gramian')
     gradcam = GradCAMSaliency(model, device)
     
-    test_classes = list(range(min(num_test_classes, num_classes)))
+    # B2: target classes are chosen per-image (top-K predictions) below;
+    #     the previous range [0..K-1] queried implausible targets.
     
     results = {
         'Jacobian': [],
@@ -461,13 +568,19 @@ def cross_class_consistency_test(model, dataloader, device, num_classes,
             break
         
         image = images[0:1].to(device)
-        
+
+        # B2: top-K predicted classes for this image.
+        with torch.no_grad():
+            _logits = model(image)
+        _topk = _logits[0].topk(min(num_test_classes, num_classes)).indices.tolist()
+        test_classes_per_image = _topk[: num_test_classes]
+
         # Compute maps for different "target" classes
         jacobian_maps = []
         gramian_maps = []
         gradcam_maps = []
-        
-        for target_class in test_classes:
+
+        for target_class in test_classes_per_image:
             try:
                 # Controllability is structural - should NOT depend on target_class
                 j_map = ctrl_j.generate(image, target_class)
@@ -807,9 +920,14 @@ class FaithfulnessEvaluator:
         h, w = image.shape[2], image.shape[3]
         n_pixels = h * w
         
-        saliency_flat = saliency.flatten()
+        # G2: jitter to break ties deterministically.
+        saliency_flat = (
+            saliency.flatten()
+            + 1e-9 * torch.randn_like(saliency.flatten())
+        )
         sorted_indices = torch.argsort(saliency_flat, descending=True)
-        baseline = image.mean()
+        # G1: per-channel baseline (shape [1, C, 1, 1] broadcasts).
+        baseline = image.mean(dim=[2, 3], keepdim=True)
         
         scores = []
         for step in range(self.num_steps + 1):
@@ -834,9 +952,13 @@ class FaithfulnessEvaluator:
         h, w = image.shape[2], image.shape[3]
         n_pixels = h * w
         
-        saliency_flat = saliency.flatten()
+        saliency_flat = (
+            saliency.flatten()
+            + 1e-9 * torch.randn_like(saliency.flatten())
+        )
         sorted_indices = torch.argsort(saliency_flat, descending=True)
-        baseline = torch.ones_like(image) * image.mean()
+        # G1: per-channel baseline, broadcast to full image shape.
+        baseline = image.mean(dim=[2, 3], keepdim=True).expand_as(image)
         
         scores = []
         for step in range(self.num_steps + 1):
@@ -1141,6 +1263,7 @@ def main():
         perturb_percent=args.perturb_percent,
     )
     all_results['perturbation_invariance'] = perturb_summary
+    all_results['perturbation_invariance_raw'] = perturb_raw   # per-sample lists for bootstrap
     
     # Test 2: Cross-Class Consistency
     _, _, test_loader2 = get_dataloader(
@@ -1154,6 +1277,7 @@ def main():
         num_test_classes=args.num_test_classes,
     )
     all_results['cross_class_consistency'] = crossclass_summary
+    all_results['cross_class_consistency_raw'] = crossclass_raw   # per-sample correlations
     
     # Test 3: Architecture Analysis
     _, _, test_loader3 = get_dataloader(
@@ -1166,6 +1290,7 @@ def main():
         num_samples=min(args.num_samples, 20),
     )
     all_results['architecture_analysis'] = arch_summary
+    all_results['architecture_analysis_raw'] = arch_raw
     
     # Test 4: State Magnitude Correlation
     _, _, test_loader4 = get_dataloader(
@@ -1190,6 +1315,7 @@ def main():
         num_samples=args.num_samples,
     )
     all_results['faithfulness'] = faith_summary
+    all_results['faithfulness_raw'] = faith_raw   # per-sample del/ins lists
     
     # ========================================
     # GENERATE FIGURES
@@ -1263,7 +1389,7 @@ def main():
     print(f"\n  ✓ Saved comprehensive_report.txt")
     
     # Save raw results
-    torch.save(all_results, output_dir / 'all_results.pth')
+    torch.save(_to_picklable(all_results), output_dir / 'all_results.pth')
     print(f"  ✓ Saved all_results.pth")
     
     # ========================================

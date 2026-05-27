@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+.installed.cfg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data (download separately from MedMNIST / torchvision / EuroSAT)
+data/*.npz
+data/*.tar.gz
+data/cifar-100-python/
+data/FashionMNIST/
+data/eurosat/
+data/MNIST/
+
+# Heavy training artifacts (excluded; see README for download instructions)
+checkpoints_vim/
+logs/
+results/
+figures/
+*.log
+*.out
+
+# Manuscript / paper artifacts (kept private)
+*.tex
+*.bbl
+*.aux
+*.bib
+*.pdf
+LOGS/
+
+# Local environment files
+.env
+*.local

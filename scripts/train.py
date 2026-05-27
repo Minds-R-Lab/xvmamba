@@ -32,12 +32,17 @@ CONFIG = {
     "npz_path":     None,              # set to path string to use a custom NPZ
 
     # --- Model -----------------------------------------------------------
+    "model_arch":   "vmamba",          # "vmamba" (hierarchical 4-direction cross-scan)
+                                       #   or "vim" (plain, bidirectional 1D scan)
     "image_size":   224,
-    "patch_size":   4,                 # 4 for medical (fine detail), 16 for natural
+    "patch_size":   4,                 # 4 for medical (fine detail), 16 for natural / Vim
     "in_channels":  None,              # None = auto-detect from dataset
     "d_state":      16,
     "dims":         [32, 64, 128, 256],
     "depths":       [2, 2, 4, 2],
+    "vim_depth":    12,                # only used when model_arch == "vim"
+    "vim_d_model":  192,               # only used when model_arch == "vim"
+    "vim_mlp_ratio": 4.0,              # only used when model_arch == "vim" (0 disables MLP)
     "drop_rate":    0.0,
     "drop_path_rate": 0.1,
 
@@ -100,6 +105,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models import VMambaClassifier, VMambaConfig
+from models.vim_classifier import VimClassifier, VimConfig
 from data import DatasetType, get_dataloader, get_dataset_info
 
 
@@ -157,18 +163,46 @@ def set_seed(seed: int):
 # ============================================================================
 
 def create_model(args, num_classes: int, in_channels: int):
-    config = VMambaConfig(
-        image_size=args.image_size,
-        patch_size=args.patch_size,
-        in_channels=in_channels,
-        dims=args.dims,
-        depths=args.depths,
-        d_state=args.d_state,
-        num_classes=num_classes,
-        drop_rate=args.drop_rate,
-        drop_path_rate=args.drop_path_rate,
-    )
-    return VMambaClassifier(config)
+    """Factory: build the requested model architecture.
+
+    Supported ``args.model_arch``:
+      - "vmamba": original hierarchical 4-direction cross-scan VMamba.
+      - "vim":    plain bidirectional 1D Vim (Zhu et al. 2024). Uses
+                  ``args.vim_depth``, ``args.vim_d_model``,
+                  ``args.vim_mlp_ratio``; respects ``args.patch_size``.
+    """
+    arch = getattr(args, "model_arch", "vmamba").lower()
+
+    if arch == "vmamba":
+        config = VMambaConfig(
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            in_channels=in_channels,
+            dims=args.dims,
+            depths=args.depths,
+            d_state=args.d_state,
+            num_classes=num_classes,
+            drop_rate=args.drop_rate,
+            drop_path_rate=args.drop_path_rate,
+        )
+        return VMambaClassifier(config)
+
+    if arch == "vim":
+        config = VimConfig(
+            image_size=args.image_size,
+            patch_size=args.patch_size,
+            in_channels=in_channels,
+            d_model=args.vim_d_model,
+            depth=args.vim_depth,
+            d_state=args.d_state,
+            num_classes=num_classes,
+            drop_rate=args.drop_rate,
+            drop_path_rate=args.drop_path_rate,
+            mlp_ratio=args.vim_mlp_ratio,
+        )
+        return VimClassifier(config)
+
+    raise ValueError(f"unknown model_arch: {arch!r} (expected 'vmamba' or 'vim')")
 
 
 # ============================================================================

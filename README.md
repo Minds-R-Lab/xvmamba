@@ -13,11 +13,15 @@ We introduce controllability analysis — a control-theoretic framework that qua
 
 ### Key Features
 
-- **Two Controllability Indices**: Jacobian-based (sensitivity propagation) and Gramian-based (closed-form for diagonal SSMs)
+- **Two Controllability Indices**: Jacobian-based (sensitivity propagation) and Gramian-based (closed-form local frozen-LTI proxy)
 - **Class-Agnostic Explanations**: Perfect cross-class consistency (correlation = 1.0)
 - **Efficient Computation**: O(LN) complexity via backward recursion
-- **Comprehensive Evaluation**: Four complementary evaluation tests
-- **Medical Imaging Focus**: Evaluated on MedMNIST datasets
+- **Cross-Architecture**: Supports VMamba (cross-scan) and Vim (bidirectional single-sequence scan)
+- **Seven Datasets**: Four MedMNIST (BloodMNIST, OCTMNIST, DermaMNIST, PneumoniaMNIST) plus three non-medical (CIFAR-100, FashionMNIST, EuroSAT)
+- **Five Saliency Baselines**: Grad-CAM, Integrated Gradients, RISE, Score-CAM, and a Random control
+- **Two Faithfulness Metrics**: Insertion/deletion AUC (audit-fixed protocol) and Internal-Attention IoU
+- **Statistical Reliability**: Three-seed multi-seed protocol with bootstrap 95% CIs
+- **Reproducible Pipeline**: Training, evaluation, and ablation scripts under `scripts/`
 
 ---
 
@@ -148,16 +152,19 @@ plt.savefig('controllability_map.png')
 
 ## Datasets
 
-We evaluate on MedMNIST datasets:
+We evaluate on seven image classification benchmarks: four medical (MedMNIST) and three non-medical, covering microscopy, OCT, dermatoscopy, X-ray, natural images, apparel imagery, and satellite remote sensing.
 
-| Dataset | Modality | Classes | Train | Val | Test |
-|---------|----------|---------|-------|-----|------|
-| BloodMNIST | Microscopy | 8 | 11,959 | 1,712 | 3,421 |
-| OCTMNIST | OCT | 4 | 97,477 | 10,832 | 1,000 |
-| DermaMNIST | Dermatoscopy | 7 | 7,007 | 1,003 | 2,005 |
-| PneumoniaMNIST | Chest X-ray | 2 | 4,708 | 524 | 624 |
+| Dataset | Modality | Classes | Source |
+|---------|----------|---------|--------|
+| BloodMNIST | Microscopy | 8 | MedMNIST v2 |
+| OCTMNIST | OCT | 4 | MedMNIST v2 |
+| DermaMNIST | Dermatoscopy | 7 | MedMNIST v2 |
+| PneumoniaMNIST | Chest X-ray | 2 | MedMNIST v2 |
+| CIFAR-100 | Natural images | 100 | torchvision |
+| FashionMNIST | Apparel imagery | 10 | torchvision |
+| EuroSAT | Sentinel-2 satellite | 10 | EuroSAT (RGB) |
 
-Datasets are automatically downloaded on first use.
+MedMNIST and torchvision datasets are downloaded automatically on first use. EuroSAT can be obtained from https://github.com/phelber/EuroSAT.
 
 ---
 
@@ -179,13 +186,41 @@ python evaluation/comprehensive_evaluation.py --checkpoint ./checkpoints/bloodmn
 
 Tests whether identified regions actually influence predictions.
 
-### 3. Faithfulness (Deletion/Insertion)
+### 3. Faithfulness (Insertion / Deletion AUC)
 
-Standard saliency evaluation measuring pixel ranking quality.
+Audit-fixed insertion/deletion AUC with a per-channel baseline, tie-jittered pixel ordering, top-K predicted-class targeting, and bootstrap 95% CIs over 50 test images. Reported as insertion AUC minus deletion AUC across all seven datasets.
 
-### 4. Architecture Analysis
+```bash
+bash scripts/run_revised_eval.sh
+```
 
-Analyzes per-stage controllability patterns.
+### 4. Internal-Attention IoU
+
+Complementary faithfulness metric measuring spatial agreement between each method's top-K mask and the model's own L2-magnitude attention pattern (top-25% region) at the last block, before the classifier head.
+
+```bash
+bash scripts/run_attention_iou_pilot.sh
+```
+
+### 5. Architecture Analysis
+
+Per-stage controllability and entropy patterns; per-direction, per-layer scan decomposition.
+
+### 6. Ablations
+
+- **Aggregation ablation** (block/stage/direction weighting): `bash scripts/run_aggregation_ablation.sh`
+- **Per-direction consistency** (forward/backward, horizontal/vertical): part of the aggregation script
+- **Misclassification stratified analysis**: `bash scripts/run_misclassification_analysis.sh`
+- **Extra saliency baselines** (Score-CAM, Integrated Gradients, RISE): `bash scripts/run_extra_baselines.sh`
+
+### 7. Multi-seed Reliability
+
+Three-seed multi-seed protocol (seeds 42, 137, 2024) for every dataset row.
+
+```bash
+bash scripts/run_multiseed.sh
+bash scripts/run_table_v_full_multiseed.sh
+```
 
 ---
 

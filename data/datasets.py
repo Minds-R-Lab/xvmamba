@@ -102,6 +102,10 @@ class DatasetType(Enum):
     CMMD = "cmmd"
     # --- Natural images ---
     CIFAR10 = "cifar10"
+    CIFAR100 = "cifar100"
+    # --- Non-medical additions (Phase 7, R1 request) ---
+    FASHIONMNIST = "fashionmnist"
+    EUROSAT = "eurosat"
     # --- Generic ---
     CUSTOM = "custom"
 
@@ -360,6 +364,41 @@ DATASET_INFO = {
         "classes": [
             "airplane", "automobile", "bird", "cat", "deer",
             "dog", "frog", "horse", "ship", "truck",
+        ],
+    },
+    DatasetType.CIFAR100: {
+        "name": "CIFAR-100",
+        "description": "Natural image classification (100 fine-grained classes)",
+        "num_classes": 100,
+        "in_channels": 3,
+        "original_size": 32,
+        "task": "multi-class",
+        # Class names are intentionally omitted; torchvision provides them
+        # at load time via dataset.classes if needed.
+    },
+    DatasetType.FASHIONMNIST: {
+        "name": "FashionMNIST",
+        "description": "Apparel-image classification (10 classes, grayscale)",
+        "num_classes": 10,
+        "in_channels": 3,    # grayscale upscaled to RGB inside the wrapper
+        "original_size": 28,
+        "task": "multi-class",
+        "classes": [
+            "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+            "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot",
+        ],
+    },
+    DatasetType.EUROSAT: {
+        "name": "EuroSAT",
+        "description": "Remote-sensing land-use classification (Sentinel-2; 10 classes)",
+        "num_classes": 10,
+        "in_channels": 3,
+        "original_size": 64,
+        "task": "multi-class",
+        "classes": [
+            "AnnualCrop", "Forest", "HerbaceousVegetation", "Highway",
+            "Industrial", "Pasture", "PermanentCrop", "Residential",
+            "River", "SeaLake",
         ],
     },
 }
@@ -1365,6 +1404,360 @@ class CustomImageDataset(Dataset):
 # Main Interface
 # ============================================================================
 
+
+
+
+# ============================================================================
+# CIFAR-100 Dataset
+# ============================================================================
+
+class CIFAR100Wrapper(Dataset):
+    """
+    Wrapper around torchvision CIFAR-100. Structurally identical to
+    `CIFAR10Wrapper` but with 100 classes; included as a non-medical
+    benchmark for the TNNLS revision per Reviewers 1, 2, 3.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform=None,
+        download: bool = True,
+        data_root: str = "./data",
+        val_ratio: float = 0.1,
+        seed: int = 42,
+    ):
+        if not TORCHVISION_DATASETS_AVAILABLE:
+            raise ImportError(
+                "torchvision datasets not available. "
+                "Install with: pip install torchvision"
+            )
+
+        self.transform = transform
+        self.split = split
+
+        if split in ("train", "val"):
+            full_dataset = tv_datasets.CIFAR100(
+                root=data_root, train=True, download=download,
+            )
+            n = len(full_dataset)
+            n_val = int(n * val_ratio)
+            n_train = n - n_val
+
+            generator = torch.Generator().manual_seed(seed)
+            train_subset, val_subset = random_split(
+                full_dataset, [n_train, n_val], generator=generator,
+            )
+
+            if split == "train":
+                self.indices = train_subset.indices
+                print(f"  Loaded CIFAR-100 (train) [{n_train} samples]")
+            else:
+                self.indices = val_subset.indices
+                print(f"  Loaded CIFAR-100 (val) [{n_val} samples]")
+
+            self.data = full_dataset.data
+            self.targets = full_dataset.targets
+            self.class_names = full_dataset.classes
+        else:
+            test_dataset = tv_datasets.CIFAR100(
+                root=data_root, train=False, download=download,
+            )
+            self.indices = list(range(len(test_dataset)))
+            self.data = test_dataset.data
+            self.targets = test_dataset.targets
+            self.class_names = test_dataset.classes
+            print(f"  Loaded CIFAR-100 (test) [{len(self.indices)} samples]")
+
+        self.num_classes = 100
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        image = self.data[real_idx]
+        label = self.targets[real_idx]
+        image = Image.fromarray(image, mode='RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, torch.tensor(label, dtype=torch.long)
+
+
+def get_cifar100_loaders(
+    batch_size: int = 32,
+    image_size: int = 224,
+    num_workers: int = 4,
+    data_root: str = "./data",
+):
+    """Train / val / test loaders for CIFAR-100."""
+    train_transform = get_train_transforms(image_size=image_size, in_channels=3)
+    eval_transform  = get_val_transforms(image_size=image_size, in_channels=3)
+
+    train_dataset = CIFAR100Wrapper(
+        split="train", transform=train_transform,
+        download=True, data_root=data_root,
+    )
+    val_dataset = CIFAR100Wrapper(
+        split="val", transform=eval_transform,
+        download=True, data_root=data_root,
+    )
+    test_dataset = CIFAR100Wrapper(
+        split="test", transform=eval_transform,
+        download=True, data_root=data_root,
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True, drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True,
+    )
+    return train_loader, val_loader, test_loader
+
+
+
+# ============================================================================
+# FashionMNIST Dataset (Phase 7, addresses R1's non-medical benchmark request)
+# ============================================================================
+
+class FashionMNISTWrapper(Dataset):
+    """
+    Wrapper around torchvision FashionMNIST with our transform pipeline.
+
+    FashionMNIST is 28x28 grayscale, 10 classes (T-shirt/top, Trouser, ...).
+    Images are resized to ``image_size`` (default 224) and converted to
+    3-channel RGB by repeating the grayscale channel so that the same
+    model architecture used for the 3-channel benchmarks can be applied
+    without modification. This matches the OCT and PneumoniaMNIST
+    grayscale-handling approach in this codebase.
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform: Optional[Callable] = None,
+        download: bool = True,
+        data_root: str = "./data",
+        val_ratio: float = 0.1,
+        seed: int = 42,
+    ):
+        if not TORCHVISION_DATASETS_AVAILABLE:
+            raise ImportError(
+                "torchvision datasets not available. "
+                "Install with: pip install torchvision"
+            )
+
+        self.transform = transform
+        self.split = split
+
+        if split in ("train", "val"):
+            full_dataset = tv_datasets.FashionMNIST(
+                root=data_root, train=True, download=download,
+            )
+            n = len(full_dataset)
+            n_val = int(n * val_ratio)
+            n_train = n - n_val
+            generator = torch.Generator().manual_seed(seed)
+            train_subset, val_subset = random_split(
+                full_dataset, [n_train, n_val], generator=generator,
+            )
+            if split == "train":
+                self.indices = train_subset.indices
+                print(f"  Loaded FashionMNIST (train) [{n_train} samples]")
+            else:
+                self.indices = val_subset.indices
+                print(f"  Loaded FashionMNIST (val) [{n_val} samples]")
+            self.data = full_dataset.data            # [N, 28, 28] uint8 tensor
+            self.targets = full_dataset.targets       # [N] tensor
+        else:
+            test_dataset = tv_datasets.FashionMNIST(
+                root=data_root, train=False, download=download,
+            )
+            self.indices = list(range(len(test_dataset)))
+            self.data = test_dataset.data
+            self.targets = test_dataset.targets
+            print(f"  Loaded FashionMNIST (test) [{len(self.indices)} samples]")
+
+        self.num_classes = 10
+        self.class_names = [
+            "T-shirt/top", "Trouser", "Pullover", "Dress", "Coat",
+            "Sandal", "Shirt", "Sneaker", "Bag", "Ankle boot",
+        ]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        image = self.data[real_idx]                  # 28x28 tensor uint8
+        label = int(self.targets[real_idx])
+        # Convert to PIL: tensor -> numpy -> PIL grayscale -> RGB
+        image_np = image.numpy() if hasattr(image, "numpy") else image
+        pil_img = Image.fromarray(image_np, mode="L").convert("RGB")
+        if self.transform:
+            pil_img = self.transform(pil_img)
+        return pil_img, torch.tensor(label, dtype=torch.long)
+
+
+def get_fashionmnist_loaders(
+    batch_size: int = 32,
+    image_size: int = 224,
+    num_workers: int = 4,
+    data_root: str = "./data",
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Train / val / test loaders for FashionMNIST, resized to ``image_size``."""
+    in_channels = 3   # we convert grayscale -> 3-channel inside the wrapper
+    train_dataset = FashionMNISTWrapper(
+        split="train",
+        transform=get_train_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    val_dataset = FashionMNISTWrapper(
+        split="val",
+        transform=get_val_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    test_dataset = FashionMNISTWrapper(
+        split="test",
+        transform=get_val_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    return (
+        DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                   num_workers=num_workers, pin_memory=True),
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                   num_workers=num_workers, pin_memory=True),
+        DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                   num_workers=num_workers, pin_memory=True),
+    )
+
+
+# ============================================================================
+# EuroSAT Dataset (Phase 7, addresses R1's remote-sensing benchmark request)
+# ============================================================================
+
+class EuroSATWrapper(Dataset):
+    """
+    Wrapper around torchvision EuroSAT with our transform pipeline.
+
+    EuroSAT is 27,000 Sentinel-2 satellite RGB images at 64x64, 10 land-use
+    classes (AnnualCrop, Forest, HerbaceousVegetation, ...). The dataset
+    has no official train/val/test split, so we apply a deterministic
+    80/10/10 random split seeded by ``seed``.
+
+    torchvision.datasets.EuroSAT was added in torchvision 0.13. If the
+    user's torchvision is older, a manual unpacking from the EuroSAT
+    archive is the fallback (not implemented here).
+    """
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform: Optional[Callable] = None,
+        download: bool = True,
+        data_root: str = "./data",
+        val_ratio: float = 0.1,
+        test_ratio: float = 0.1,
+        seed: int = 42,
+    ):
+        if not TORCHVISION_DATASETS_AVAILABLE:
+            raise ImportError(
+                "torchvision datasets not available. "
+                "Install with: pip install torchvision"
+            )
+        try:
+            full_dataset = tv_datasets.EuroSAT(
+                root=data_root, download=download,
+            )
+        except AttributeError:
+            raise ImportError(
+                "tv_datasets.EuroSAT not available. "
+                "Upgrade torchvision to >= 0.13."
+            )
+
+        self.transform = transform
+        self.split = split
+        self.full_dataset = full_dataset
+
+        n = len(full_dataset)
+        n_test = int(n * test_ratio)
+        n_val  = int(n * val_ratio)
+        n_train = n - n_test - n_val
+        generator = torch.Generator().manual_seed(seed)
+        train_subset, val_subset, test_subset = random_split(
+            full_dataset, [n_train, n_val, n_test], generator=generator,
+        )
+        if split == "train":
+            self.indices = train_subset.indices
+            print(f"  Loaded EuroSAT (train) [{n_train} samples]")
+        elif split == "val":
+            self.indices = val_subset.indices
+            print(f"  Loaded EuroSAT (val) [{n_val} samples]")
+        else:
+            self.indices = test_subset.indices
+            print(f"  Loaded EuroSAT (test) [{n_test} samples]")
+
+        self.num_classes = 10
+        self.class_names = [
+            "AnnualCrop", "Forest", "HerbaceousVegetation", "Highway",
+            "Industrial", "Pasture", "PermanentCrop", "Residential",
+            "River", "SeaLake",
+        ]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        real_idx = self.indices[idx]
+        image, label = self.full_dataset[real_idx]
+        # `image` is a PIL.Image in RGB mode already.
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, torch.tensor(int(label), dtype=torch.long)
+
+
+def get_eurosat_loaders(
+    batch_size: int = 32,
+    image_size: int = 224,
+    num_workers: int = 4,
+    data_root: str = "./data",
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Train / val / test loaders for EuroSAT, resized to ``image_size``."""
+    in_channels = 3
+    train_dataset = EuroSATWrapper(
+        split="train",
+        transform=get_train_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    val_dataset = EuroSATWrapper(
+        split="val",
+        transform=get_val_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    test_dataset = EuroSATWrapper(
+        split="test",
+        transform=get_val_transforms(image_size, in_channels, already_resized=False),
+        data_root=data_root,
+    )
+    return (
+        DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                   num_workers=num_workers, pin_memory=True),
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                   num_workers=num_workers, pin_memory=True),
+        DataLoader(test_dataset, batch_size=batch_size, shuffle=False,
+                   num_workers=num_workers, pin_memory=True),
+    )
+
+
 def get_dataloader(
     dataset_type: DatasetType,
     batch_size: int = 32,
@@ -1416,10 +1809,24 @@ def get_dataloader(
     if dataset_type == DatasetType.CMMD:
         return get_cmmd_loaders(batch_size, image_size, num_workers, data_root)
 
+    # ---- CIFAR-100 ----
+    if dataset_type == DatasetType.CIFAR100:
+        return get_cifar100_loaders(batch_size, image_size, num_workers, data_root)
+
     # ---- CIFAR-10 ----
     if dataset_type == DatasetType.CIFAR10:
         return get_cifar10_loaders(batch_size, image_size, num_workers,
                                    data_root)
+
+    # ---- FashionMNIST ----
+    if dataset_type == DatasetType.FASHIONMNIST:
+        return get_fashionmnist_loaders(batch_size, image_size,
+                                        num_workers, data_root)
+
+    # ---- EuroSAT ----
+    if dataset_type == DatasetType.EUROSAT:
+        return get_eurosat_loaders(batch_size, image_size,
+                                   num_workers, data_root)
 
     raise ValueError(
         f"Unknown dataset type: {dataset_type}. "
